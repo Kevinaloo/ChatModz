@@ -5,9 +5,8 @@ import crypto from "node:crypto"
 import { createServer as createViteServer } from "vite"
 import chatmodzRouter, { mediaStorage } from "./server/chatmodz"
 
-async function startServer() {
+export function createApp() {
   const app = express()
-  const PORT = 3000
 
   // Enable CORS
   app.use(cors())
@@ -82,6 +81,13 @@ async function startServer() {
   // Mount Chatmodz API router
   app.use("/api/chatmodz", chatmodzRouter)
 
+  return app
+}
+
+async function startServer() {
+  const app = createApp()
+  const PORT = 3000
+
   // Vite middleware in dev, static files in production
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -102,6 +108,10 @@ async function startServer() {
   })
 }
 
-startServer().catch((error) => {
-  console.error("Failed to start server:", error)
-})
+if (!process.env.VERCEL) {
+  startServer().catch((error) => {
+    console.error("Failed to start server:", error)
+  })
+}
+
+export default createApp

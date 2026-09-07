@@ -1,4 +1,5 @@
 import { createPool, type Pool, type PoolConnection } from "mysql2/promise"
+import { createClient, type SupabaseClient } from "@supabase/supabase-js"
 import crypto from "node:crypto"
 import bcrypt from "bcryptjs"
 
@@ -393,3 +394,66 @@ export function getDatabasePool(): Pool | null {
 export function isUsingMySQL(): boolean {
   return Boolean(process.env.CHATMODZ_DATABASE_URL && mysqlPool)
 }
+
+let supabaseClient: SupabaseClient | null = null
+
+export function getSupabaseClient(): SupabaseClient | null {
+  const url = process.env.SUPABASE_URL || "https://xmqrntslxacmvkljgvsc.supabase.co"
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhtcXJudHNseGFjbXZrbGpndnNjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg3ODc2MjAsImV4cCI6MjEwNDM2MzYyMH0.A4rmU_TVbSBQs-IZ_Htq58bLA0Nf-KiU3-JOV6tegRE"
+  if (!url || !key) return null
+  if (!supabaseClient) {
+    try {
+      supabaseClient = createClient(url, key, {
+        auth: { persistSession: false },
+      })
+    } catch (err) {
+      console.warn("Could not initialize Supabase client:", err)
+      return null
+    }
+  }
+  return supabaseClient
+}
+
+export function isUsingSupabase(): boolean {
+  return Boolean(getSupabaseClient())
+}
+
+export async function checkSupabaseConnection(): Promise<{
+  configured: boolean
+  connected: boolean
+  url: string
+  tablesFound: string[]
+  error?: string
+}> {
+  const client = getSupabaseClient()
+  const url = process.env.SUPABASE_URL || "https://xmqrntslxacmvkljgvsc.supabase.co"
+  if (!client) {
+    return { configured: false, connected: false, url, tablesFound: [], error: "Supabase client not configured" }
+  }
+
+  const tablesToCheck = ["operators", "operator_applications", "sites", "conversations", "messages"]
+  const tablesFound: string[] = []
+  let lastError: string | undefined
+
+  for (const table of tablesToCheck) {
+    try {
+      const { error } = await client.from(table).select("id").limit(1)
+      if (!error) {
+        tablesFound.push(table)
+      } else if (error.code !== "PGRST205") {
+        lastError = error.message
+      }
+    } catch (e: any) {
+      lastError = e.message
+    }
+  }
+
+  return {
+    configured: true,
+    connected: tablesFound.length > 0,
+    url,
+    tablesFound,
+    error: tablesFound.length === 0 ? "Tables not yet initialized in Supabase SQL editor" : lastError,
+  }
+}
+

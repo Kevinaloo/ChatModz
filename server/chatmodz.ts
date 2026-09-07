@@ -1,9 +1,11 @@
 import { Router, type NextFunction, type Request, type Response } from "express"
 import crypto from "node:crypto"
+import fs from "node:fs"
+import path from "node:path"
 import bcrypt from "bcryptjs"
 import jwt from "jsonwebtoken"
 import webpush from "web-push"
-import { getDatabasePool, isUsingMySQL, memoryDb, type Operator, type Conversation, type Message } from "./db"
+import { getDatabasePool, isUsingMySQL, memoryDb, getSupabaseClient, checkSupabaseConnection, type Operator, type Conversation, type Message } from "./db"
 
 const router = Router()
 const LOCK_MINUTES = 10
@@ -911,6 +913,17 @@ router.post("/integrations/:siteKey/messages", async (req, res) => {
 // Admin - Applications
 router.get("/admin/applications", requireChatmodzAuth, requireChatmodzAdmin, async (_req, res) => {
   try {
+    const supabase = getSupabaseClient()
+    if (supabase) {
+      try {
+        const { data, error } = await supabase
+          .from("operator_applications")
+          .select("*")
+          .order("created_at", { ascending: false })
+          .limit(200)
+        if (!error && data && data.length > 0) return res.json({ applications: data })
+      } catch {}
+    }
     if (isUsingMySQL()) {
       const applications = await executeMySQLQuery("SELECT id, full_name, email, location, experience, status, created_at, reviewed_at FROM operator_applications ORDER BY created_at DESC LIMIT 200")
       return res.json({ applications })
@@ -926,6 +939,30 @@ router.post("/admin/applications/:id/approve", requireChatmodzAuth, requireChatm
   try {
     const operatorPublicId = crypto.randomBytes(13).toString("base64url")
     const activationCode = `cmz-${crypto.randomBytes(18).toString("base64url")}`
+    const initialPasswordHash = await bcrypt.hash(crypto.randomBytes(32).toString("hex"), 12)
+
+    const supabase = getSupabaseClient()
+    if (supabase) {
+      try {
+        const { data: appData } = await supabase.from("operator_applications").select("*").eq("id", applicationId).maybeSingle()
+        if (appData) {
+          await supabase.from("operator_applications").update({
+            status: "approved",
+            reviewed_by: req.chatmodzOperator!.id,
+            reviewed_at: new Date().toISOString(),
+          }).eq("id", applicationId)
+
+          await supabase.from("operators").insert({
+            public_id: operatorPublicId,
+            full_name: appData.full_name,
+            email: appData.email,
+            password_hash: initialPasswordHash,
+            role: "operator",
+            status: "training",
+          })
+        }
+      } catch {}
+    }
 
     if (isUsingMySQL()) {
       const rows = await executeMySQLQuery<any>("SELECT * FROM operator_applications WHERE id = ? LIMIT 1", [applicationId])
@@ -935,7 +972,6 @@ router.post("/admin/applications/:id/approve", requireChatmodzAuth, requireChatm
       const existing = await executeMySQLQuery<any>("SELECT id FROM operators WHERE email = ? LIMIT 1", [application.email])
       if (existing.length) return res.status(409).json({ error: "An operator already uses this email" })
 
-      const initialPasswordHash = await bcrypt.hash(crypto.randomBytes(32).toString("hex"), 12)
       await withMySQLTransaction(async (connection) => {
         const created: any = await connection.execute(
           "INSERT INTO operators (public_id, full_name, email, password_hash, role, status) VALUES (?, ?, ?, ?, 'operator', 'training')",
@@ -959,7 +995,6 @@ router.post("/admin/applications/:id/approve", requireChatmodzAuth, requireChatm
       if (existing) return res.status(409).json({ error: "An operator already uses this email" })
 
       const newOpId = memoryDb.operators.length + 1
-      const initialPasswordHash = await bcrypt.hash(crypto.randomBytes(32).toString("hex"), 12)
       memoryDb.operators.push({
         id: newOpId,
         public_id: operatorPublicId,
@@ -993,6 +1028,16 @@ router.post("/admin/applications/:id/approve", requireChatmodzAuth, requireChatm
 router.post("/admin/applications/:id/reject", requireChatmodzAuth, requireChatmodzAdmin, async (req, res) => {
   const applicationId = Number(req.params.id)
   try {
+    const supabase = getSupabaseClient()
+    if (supabase) {
+      try {
+        await supabase.from("operator_applications").update({
+          status: "rejected",
+          reviewed_by: req.chatmodzOperator!.id,
+          reviewed_at: new Date().toISOString(),
+        }).eq("id", applicationId)
+      } catch {}
+    }
     if (isUsingMySQL()) {
       await executeMySQLQuery(
         "UPDATE operator_applications SET status = 'rejected', reviewed_by = ?, reviewed_at = NOW() WHERE id = ?",
@@ -1012,9 +1057,73 @@ router.post("/admin/applications/:id/reject", requireChatmodzAuth, requireChatmo
   }
 })
 
+router.delete("/admin/applications/:id", requireChatmodzAuth, requireChatmodzAdmin, async (req, res) => {
+  const applicationId = Number(req.params.id)
+  try {
+    const supabase = getSupabaseClient()
+    if (supabase) {
+      try {
+        await supabase.from("operator_applications").delete().eq("id", applicationId)
+      } catch {}
+    }
+    if (isUsingMySQL()) {
+      await executeMySQLQuery("DELETE FROM operator_applications WHERE id = ?", [applicationId])
+    } else {
+      const idx = memoryDb.applications.findIndex((a) => a.id === applicationId)
+      if (idx !== -1) memoryDb.applications.splice(idx, 1)
+    }
+    res.json({ deleted: true })
+  } catch (error) {
+    res.status(500).json({ error: "Could not delete application" })
+  }
+})
+
+// Admin - Database & Supabase Status
+router.get("/admin/db-status", requireChatmodzAuth, requireChatmodzAdmin, async (_req, res) => {
+  try {
+    const supabaseHealth = await checkSupabaseConnection()
+    res.json({
+      supabase: supabaseHealth,
+      mysql: {
+        configured: Boolean(process.env.CHATMODZ_DATABASE_URL),
+        active: isUsingMySQL(),
+      },
+      activeMode: supabaseHealth.connected ? "supabase_postgres" : isUsingMySQL() ? "mysql" : "in_memory",
+      stats: {
+        operatorsCount: memoryDb.operators.length,
+        applicationsCount: memoryDb.applications.length,
+        conversationsCount: memoryDb.conversations.length,
+        sitesCount: memoryDb.sites.length,
+      },
+    })
+  } catch (error) {
+    res.status(500).json({ error: "Could not retrieve database status" })
+  }
+})
+
+router.get("/admin/sql-schema", requireChatmodzAuth, requireChatmodzAdmin, async (_req, res) => {
+  try {
+    const schemaPath = path.join(process.cwd(), "database", "schema.supabase.sql")
+    if (fs.existsSync(schemaPath)) {
+      const sql = fs.readFileSync(schemaPath, "utf8")
+      return res.json({ sql })
+    }
+    res.status(404).json({ error: "schema.supabase.sql not found on disk" })
+  } catch (error) {
+    res.status(500).json({ error: "Could not load schema" })
+  }
+})
+
 // Admin - Operators
 router.get("/admin/operators", requireChatmodzAuth, requireChatmodzAdmin, async (_req, res) => {
   try {
+    const supabase = getSupabaseClient()
+    if (supabase) {
+      try {
+        const { data, error } = await supabase.from("operators").select("id, public_id, full_name, email, role, status, last_active_at, created_at").order("created_at", { ascending: false })
+        if (!error && data && data.length > 0) return res.json({ operators: data })
+      } catch {}
+    }
     if (isUsingMySQL()) {
       const operators = await executeMySQLQuery("SELECT id, public_id, full_name, email, role, status, last_active_at, created_at FROM operators ORDER BY created_at DESC")
       return res.json({ operators })
@@ -1033,6 +1142,68 @@ router.get("/admin/operators", requireChatmodzAuth, requireChatmodzAdmin, async 
     })
   } catch (error) {
     res.status(500).json({ error: "Operators unavailable" })
+  }
+})
+
+router.post("/admin/operators/create", requireChatmodzAuth, requireChatmodzAdmin, async (req, res) => {
+  const { fullName, email, password, role = "operator" } = req.body || {}
+  if (!String(fullName || "").trim() || !String(email || "").includes("@") || !String(password || "").trim()) {
+    return res.status(400).json({ error: "Name, valid email, and password are required" })
+  }
+  const cleanEmail = String(email).trim().toLowerCase()
+  const cleanName = String(fullName).trim()
+  const publicId = `cmz_${role === "admin" ? "admin" : "oper"}_${crypto.randomBytes(6).toString("hex")}`
+  const passwordHash = await bcrypt.hash(String(password), 10)
+
+  try {
+    const supabase = getSupabaseClient()
+    if (supabase) {
+      const { data, error } = await supabase.from("operators").insert({
+        public_id: publicId,
+        full_name: cleanName,
+        email: cleanEmail,
+        password_hash: passwordHash,
+        role: role === "admin" ? "admin" : "operator",
+        status: "active",
+      }).select().single()
+      if (!error && data) {
+        memoryDb.operators.push({
+          id: data.id,
+          public_id: publicId,
+          full_name: cleanName,
+          email: cleanEmail,
+          password_hash: passwordHash,
+          role: role === "admin" ? "admin" : "operator",
+          status: "active",
+          created_at: new Date(),
+        })
+        return res.status(201).json({ created: true, operator: publicOperator(data as any) })
+      }
+    }
+
+    if (isUsingMySQL()) {
+      const result: any = await executeMySQLQuery(
+        "INSERT INTO operators (public_id, full_name, email, password_hash, role, status) VALUES (?, ?, ?, ?, ?, 'active')",
+        [publicId, cleanName, cleanEmail, passwordHash, role],
+      )
+      return res.status(201).json({ created: true, id: result.insertId })
+    }
+
+    const newId = memoryDb.operators.length + 1
+    const newOp: Operator = {
+      id: newId,
+      public_id: publicId,
+      full_name: cleanName,
+      email: cleanEmail,
+      password_hash: passwordHash,
+      role: role === "admin" ? "admin" : "operator",
+      status: "active",
+      created_at: new Date(),
+    }
+    memoryDb.operators.push(newOp)
+    res.status(201).json({ created: true, operator: publicOperator(newOp) })
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "Could not create operator" })
   }
 })
 

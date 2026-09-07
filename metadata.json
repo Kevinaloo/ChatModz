@@ -1,0 +1,6 @@
+{
+  "name": "ChatModz",
+  "description": "Multi-site live conversation operator desk with real-time locking, anonymous queue dispatch, integration adapters, delivery tracking, and administrative controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
